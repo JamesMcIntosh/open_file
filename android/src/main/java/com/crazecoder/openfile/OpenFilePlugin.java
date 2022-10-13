@@ -10,10 +10,12 @@ import android.content.pm.ResolveInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.provider.Settings;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
+import androidx.core.app.ActivityCompat;
 import androidx.core.content.FileProvider;
 import androidx.core.content.ContextCompat;
 import androidx.core.content.PermissionChecker;
@@ -39,14 +41,14 @@ import java.util.Map;
 /**
  * OpenFilePlugin
  */
-public class OpenFilePlugin implements MethodCallHandler
-        , FlutterPlugin
-        , ActivityAware {
-    /**
-     * Plugin registration.
-     */
-    private @Nullable
-    FlutterPluginBinding flutterPluginBinding;
+public class OpenFilePlugin implements FlutterPlugin, MethodCallHandler, ActivityAware, PluginRegistry.RequestPermissionsResultListener, PluginRegistry.ActivityResultListener {
+
+    private static final int REQUEST_CODE = 33432;
+    private static final int RESULT_CODE = 0x12;
+
+    private static final String TYPE_PREFIX_IMAGE = "image/";
+    private static final String TYPE_PREFIX_VIDEO = "video/";
+    private static final String TYPE_PREFIX_AUDIO = "audio/";
 
     private Context context;
     private Activity activity;
@@ -55,11 +57,17 @@ public class OpenFilePlugin implements MethodCallHandler
 
     private Result result;
     private String filePath;
-    private String mimeType;
+    private String typeString;
 
     private boolean isResultSubmitted = false;
 
-    private static final String TYPE_STRING_APK = "application/vnd.android.package-archive";
+    @Deprecated
+    public static void registerWith(PluginRegistry.Registrar registrar) {
+        OpenFilePlugin plugin = new OpenFilePlugin();
+        plugin.activity = registrar.activity();
+        plugin.context = registrar.context();
+        plugin.channel = new MethodChannel(registrar.messenger(), "open_file");
+    }
 
     @Override
     public void onMethodCall(MethodCall call, @NonNull Result result) {
@@ -68,51 +76,87 @@ public class OpenFilePlugin implements MethodCallHandler
             this.result = result;
             filePath = call.argument("file_path");
             if (call.hasArgument("type") && call.argument("type") != null) {
-                mimeType = call.argument("type");
+                typeString = call.argument("type");
             } else {
-                mimeType = getFileMimeType(filePath);
+                typeString = getFileMimeType(filePath);
             }
             if (!isFileAvailable()) {
                 return;
             }
             if (pathRequiresPermission()) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && isExternalStoragePublicMedia(mimeType)) {
-                        if (isImage(mimeType) && !hasPermission(Manifest.permission.READ_MEDIA_IMAGES) && !Environment.isExternalStorageManager()) {
-                            result(-3, "Permission denied: " + Manifest.permission.READ_MEDIA_IMAGES);
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                        if (!isMediaStorePath() && !Environment.isExternalStorageManager()) {
+                            result(-3, "Permission denied: android.Manifest.permission.MANAGE_EXTERNAL_STORAGE");
                             return;
                         }
-                        if (isVideo(mimeType) && !hasPermission(Manifest.permission.READ_MEDIA_VIDEO) && !Environment.isExternalStorageManager()) {
-                            result(-3, "Permission denied: " + Manifest.permission.READ_MEDIA_VIDEO);
-                            return;
-                        }
-                        if (isAudio(mimeType) && !hasPermission(Manifest.permission.READ_MEDIA_AUDIO) && !Environment.isExternalStorageManager()) {
-                            result(-3, "Permission denied: " + Manifest.permission.READ_MEDIA_AUDIO);
-                            return;
-                        }
-                    } else if (!Environment.isExternalStorageManager()) {
-                        result(-3, "Permission denied: " + Manifest.permission.MANAGE_EXTERNAL_STORAGE);
-                        return;
                     }
-                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    if (!hasPermission(Manifest.permission.READ_EXTERNAL_STORAGE)) {
-                        result(-3, "Permission denied: " + Manifest.permission.READ_EXTERNAL_STORAGE);
-                        return;
-                    }
-
                 }
+                if (checkPermissions()) {
+                    startActivity();
+                }
+            } else {
+                startActivity();
             }
-            if (TYPE_STRING_APK.equals(mimeType)) {
-                openApkFile();
-                return;
-            }
-            startActivity();
         } else {
             result.notImplemented();
             isResultSubmitted = true;
         }
     }
 
+    private boolean checkPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (typeStartsWith(TYPE_PREFIX_IMAGE, typeString)) {
+                if (!hasPermission(Manifest.permission.READ_MEDIA_IMAGES) && !Environment.isExternalStorageManager()) {
+                    ActivityCompat.requestPermissions(activity, new String[]{Manifest.permission.READ_MEDIA_IMAGES}, REQUEST_CODE);
+                    return false;
+                }
+            } else if (typeStartsWith(TYPE_PREFIX_VIDEO, typeString)) {
+                if (!hasPermission(Manifest.permission.READ_MEDIA_VIDEO) && !Environment.isExternalStorageManager()) {
+                    ActivityCompat.requestPermissions(activity, new String[]{Manifest.permission.READ_MEDIA_VIDEO}, REQUEST_CODE);
+                    return false;
+                }
+            } else if (typeStartsWith(TYPE_PREFIX_AUDIO, typeString)) {
+                if (!hasPermission(Manifest.permission.READ_MEDIA_AUDIO) && !Environment.isExternalStorageManager()) {
+                    ActivityCompat.requestPermissions(activity, new String[]{Manifest.permission.READ_MEDIA_AUDIO}, REQUEST_CODE);
+                    return false;
+                }
+            }
+        } else {
+            if (!hasPermission(Manifest.permission.READ_EXTERNAL_STORAGE)) {
+                ActivityCompat.requestPermissions(activity, new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, REQUEST_CODE);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean typeStartsWith(String prefix, String fileType) {
+        return fileType != null && fileType.startsWith(prefix);
+    }
+
+    private boolean isMediaStorePath() {
+        boolean isMediaStorePath = false;
+        final String[] mediaStorePath = {
+                "/DCIM/",
+                "/Pictures/",
+                "/Movies/",
+                "/Alarms/",
+                "/Audiobooks/",
+                "/Music/",
+                "/Notifications/",
+                "/Podcasts/",
+                "/Ringtones/",
+                "/Download/"
+        };
+        for (String s : mediaStorePath) {
+            if (filePath.contains(s)) {
+                isMediaStorePath = true;
+                break;
+            }
+        }
+        return isMediaStorePath;
+    }
 
     private boolean hasPermission(String permission) {
         return ContextCompat.checkSelfPermission(activity, permission) == PermissionChecker.PERMISSION_GRANTED;
@@ -163,7 +207,9 @@ public class OpenFilePlugin implements MethodCallHandler
         if (!isFileAvailable()) {
             return;
         }
+
         Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
         intent.addCategory(Intent.CATEGORY_DEFAULT);
         Uri uri;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -171,7 +217,7 @@ public class OpenFilePlugin implements MethodCallHandler
         } else {
             uri = Uri.fromFile(new File(filePath));
         }
-        intent.setDataAndType(uri, mimeType);
+        intent.setDataAndType(uri, typeString);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
         List<ResolveInfo> resolveInfoList;
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
@@ -254,7 +300,7 @@ public class OpenFilePlugin implements MethodCallHandler
             case "gpx":
                 return "application/gpx+xml";
             case "apk":
-                return TYPE_STRING_APK;
+                return "application/vnd.android.package-archive";
             case "asf":
                 return "video/x-ms-asf";
             case "avi":
@@ -385,17 +431,27 @@ public class OpenFilePlugin implements MethodCallHandler
         }
     }
 
-    private void openApkFile() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !canInstallApk()) {
-            result(-3, "Permission denied: " + Manifest.permission.REQUEST_INSTALL_PACKAGES);
-        } else {
-            startActivity();
+    @RequiresApi(api = Build.VERSION_CODES.M)
+    @Override
+    public boolean onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode != REQUEST_CODE) return false;
+        for (String permission : permissions) {
+            if (!hasPermission(permission)) {
+                result(-3, "Permission denied: " + permission);
+                return false;
+            }
         }
+        startActivity();
+        return true;
     }
 
-    @RequiresApi(api = Build.VERSION_CODES.O)
-    private boolean canInstallApk() {
-        return activity.getPackageManager().canRequestPackageInstalls();
+    @RequiresApi(api = Build.VERSION_CODES.M)
+    @Override
+    public boolean onActivityResult(int requestCode, int resultCode, @Nullable Intent intent) {
+        if (requestCode == RESULT_CODE) {
+            startActivity();
+        }
+        return false;
     }
 
     private void result(int type, String message) {
@@ -407,8 +463,10 @@ public class OpenFilePlugin implements MethodCallHandler
     }
 
     @Override
-    public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
-        this.flutterPluginBinding = binding;
+    public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
+        this.context = flutterPluginBinding.getApplicationContext();
+        this.channel = new MethodChannel(flutterPluginBinding.getBinaryMessenger(), "open_file");
+        this.channel.setMethodCallHandler(this);
     }
 
     @Override
@@ -420,22 +478,18 @@ public class OpenFilePlugin implements MethodCallHandler
 
         channel.setMethodCallHandler(null);
         channel = null;
-        this.flutterPluginBinding = null;
     }
 
     @Override
     public void onAttachedToActivity(ActivityPluginBinding binding) {
-        channel =
-                new MethodChannel(
-                        flutterPluginBinding.getBinaryMessenger(), "open_file");
-        context = flutterPluginBinding.getApplicationContext();
         activity = binding.getActivity();
-        channel.setMethodCallHandler(this);
+        binding.addRequestPermissionsResultListener(this);
+        binding.addActivityResultListener(this);
     }
 
     @Override
     public void onDetachedFromActivityForConfigChanges() {
-        onDetachedFromActivity();
+            // Do nothing
     }
 
     @Override
@@ -445,6 +499,6 @@ public class OpenFilePlugin implements MethodCallHandler
 
     @Override
     public void onDetachedFromActivity() {
-
+        // Do nothing
     }
 }
